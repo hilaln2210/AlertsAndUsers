@@ -1,25 +1,28 @@
 from flask import Flask, jsonify
 from flask_cors import CORS
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
+import gspread
+from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 CORS(app)
 
-USERS_API = "https://sheetdb.io/api/v1/v88pii4vv3hni"
+SHEET_NAME = "Users"
+SPREADSHEET_ID = "1DQvAegPUtDDsYnxJ2FOnYQvWRy0Z96zgl9AYEkd8usI"
+creds = Credentials.from_service_account_file("credentials.json", scopes=[
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+])
+client = gspread.authorize(creds)
+sheet = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
 
 def normalize(city):
     return city.strip().replace("־", "-").replace("–", "-").replace("״", "").replace("'", "").lower()
 
 def city_match(user_city, alert_data):
     user_city_norm = normalize(user_city)
-    if isinstance(alert_data, list):
-        candidates = alert_data
-    elif isinstance(alert_data, str):
-        candidates = [alert_data]
-    else:
-        return False
-
+    candidates = alert_data if isinstance(alert_data, list) else [alert_data]
     for loc in candidates:
         loc_norm = normalize(loc)
         if user_city_norm in loc_norm or loc_norm in user_city_norm:
@@ -30,74 +33,32 @@ def city_match(user_city, alert_data):
             return True
     return False
 
-def fetch_users():
-    res = requests.get(USERS_API)
-    users = res.json()
-    print(f"👥 נשלפו {len(users)} משתמשים מהטבלה")
-    return users
-
-def fetch_alerts_range_multi(from_date, to_date):
-    start = datetime.strptime(from_date, "%d.%m.%Y")
-    end = datetime.strptime(to_date, "%d.%m.%Y")
-    all_alerts = []
-
-    while start <= end:
-        date_str = start.strftime("%d.%m.%Y")
-        url = f"https://alerts-history.oref.org.il/Shared/Ajax/GetAlarmsHistory.aspx?lang=he&fromDate={date_str}&toDate={date_str}&mode=0"
-        res = requests.get(url)
-        alerts = [a for a in res.json() if str(a.get("category")) == "1"]
-        print(f"📅 {date_str}: נמצאו {len(alerts)} התראות")
-        all_alerts.extend(alerts)
-        start += timedelta(days=1)
-
-    print(f"\n📦 סה״כ {len(all_alerts)} התראות בכל הטווח")
-    return all_alerts
-
-def update_last_alert(name, last_str):
-    url = f"{USERS_API}/name/{name}"
-    payload = { "data": { "last_alert": last_str } }
-    res = requests.patch(url, json=payload)
-    if res.status_code == 200:
-        print(f"📌 עודכן last_alert עבור {name}: {last_str}")
-    else:
-        print(f"⚠️ שגיאה בעדכון last_alert עבור {name}")
+def fetch_alerts(date_str):
+    url = f"https://alerts-history.oref.org.il/Shared/Ajax/GetAlarmsHistory.aspx?lang=he&fromDate={date_str}&toDate={date_str}&mode=0"
+    res = requests.get(url)
+    return [a for a in res.json() if str(a.get("category")) == "1"]
 
 @app.route("/check-alerts", methods=["GET"])
 def check_alerts():
-    today = datetime.now().strftime("%d.%m.%Y")
-    users = fetch_users()
-    alerts = fetch_alerts_range_multi(today, today)
+    users = sheet.get_all_records()
+    print(f"👥 נשלפו {len(users)} משתמשים מהגיליון")
+    date_today = datetime.now().strftime("%d.%m.%Y")
+    alerts = fetch_alerts(date_today)
+    print(f"📅 {date_today}: נמצאו {len(alerts)} התראות")
 
-    result = []
-    print("\n📊 תוצאות לפי משתמש:")
-    print("───────────────────────────────")
-
-    for u in users:
-        user_c = u.get("city")
-        matched = [a for a in alerts if city_match(user_c, a["data"])]
-        alert_list = [{"date": a["date"], "time": a["time"]} for a in sorted(matched, key=lambda x: x["alertDate"])]
-
-        if alert_list:
-            print(f"🔴 {u['name']} ({user_c}) → נמצאו {len(alert_list)} אזעקות")
-            for a in alert_list:
-                print(f"    • {a['date']} בשעה {a['time']}")
-            latest = alert_list[-1]
-            last_str = f"{latest['date']} {latest['time']}"
-            update_last_alert(u["name"], last_str)
+    for i, u in enumerate(users, start=2):
+        user_city = u.get("city")
+        matched = [a for a in alerts if city_match(user_city, a["data"])]
+        if matched:
+            last_alert = matched[-1]["date"] + " " + matched[-1]["time"]
+            sheet.update_cell(i, u.keys().index("last_alert") + 1, last_alert)
+            print(f"🔴 {u['name']} ({user_city}) → {last_alert}")
         else:
-            print(f"🟢 {u['name']} ({user_c}) → לא נמצאה אזעקה")
+            print(f"🟢 {u['name']} ({user_city}) → אין אזעקות")
 
-        result.append({
-            "name": u["name"],
-            "city": user_c,
-            "alerts": alert_list,
-            "last_alert": alert_list[-1] if alert_list else None
-        })
-
-    print("───────────────────────────────")
-    print(f"\n✅ סיום בדיקה - {len(result)} משתמשים עובדו\n")
-    return jsonify(result)
+    print("\n✅ בדיקה הושלמה")
+    return jsonify({"status": "ok"})
 
 if __name__ == "__main__":
-    print("🚀 Flask server is starting on http://localhost:5000 ...")
+    print("🚀 Flask server is starting...")
     app.run(debug=True)
